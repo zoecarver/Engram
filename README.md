@@ -18,7 +18,7 @@ Fused RMSNorm + dot-product gate + gated value projection, streaming one sequenc
 
 Each position loops over 32 hidden-dimension tiles (1024-dim) using `(1,1)` tile dataflow buffers:
 
-1. **RMSNorm key** -- two passes: accumulate per-row sum-of-squares across 32 tiles, then normalize with broadcast rsqrt
+1. **RMSNorm key** -- two passes: accumulate per-row sum-of-squares across 32 tiles, then compute broadcast rsqrt
 2. **RMSNorm query** -- same pattern
 3. **Dot-product gate** -- interleaved normalize + element-wise multiply + reduce, fused into a single loop over hidden tiles
 4. **Gate * Value** -- broadcast scalar gate across all 32 value tiles
@@ -29,7 +29,7 @@ The original PyTorch reference (`engram_demo_v1.py`) does `key_proj` and `value_
 
 Depthwise conv1d (kernel_size=4, dilation=3) with SiLU activation on a fixed 4-core grid with inter-core boundary sharing via `PipeNet`.
 
-The host pre-shifts the input by `[0, 3, 6, 9]` positions (causal dilation offsets) and the kernel computes a streaming weighted sum + SiLU. After processing its last input tile, each core pipes the boundary tile to the next core for overlap handling.
+The host pre-normalizes (RMSNorm) and pre-shifts the input by `[0, 3, 6, 9]` positions (causal dilation offsets), and the kernel computes a streaming weighted sum + SiLU. After processing its last input tile, each core pipes the boundary tile to the next core for overlap handling.
 
 The original reference uses `nn.Conv1d` with `groups=total_channels` (depthwise). The TT-Lang version decomposes this into explicit shift + weight + fuse, which maps naturally to the streaming tile model.
 
