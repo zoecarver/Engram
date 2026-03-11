@@ -365,16 +365,17 @@ if __name__ == "__main__":
         shifted = [host_shift(normed, s, SEQ) for s in shifts]
 
         # Conv weights for this HC group's channels
-        # nn.Conv1d correlation: out[t] = w[0]*in[t-9] + w[1]*in[t-6] + w[2]*in[t-3] + w[3]*in[t]
-        # Our shifts: s0=shift0 (in[t]), s1=shift3 (in[t-3]), s2=shift6 (in[t-6]), s3=shift9 (in[t-9])
-        # So: w[3] pairs with s0, w[2] with s1, w[1] with s2, w[0] with s3
+        # nn.Conv1d applies: out[t] = sum_k w[k] * in[t - padding + k*dilation]
+        # With padding=9, dilation=3: w[k] * in[t - 9 + k*3]
+        # k=0: in[t-9], k=1: in[t-6], k=2: in[t-3], k=3: in[t]
+        # Our shifts: s0=in[t], s1=in[t-3], s2=in[t-6], s3=in[t-9]
+        # So: s0 pairs with w[3], s1 with w[2], s2 with w[1], s3 with w[0]
         ch_start = hc_idx * HIDDEN_DIM
         ch_end = ch_start + HIDDEN_DIM
         conv_w = module.conv.weight.data[ch_start:ch_end, 0, :].to(torch.bfloat16)
 
         weight_tiles = []
         for k in range(KERNEL_SIZE):
-            # Reverse: shift k*DILATION pairs with weight[KERNEL_SIZE-1-k]
             w_row = conv_w[:, KERNEL_SIZE - 1 - k].unsqueeze(0).expand(TILE, -1).contiguous()
             weight_tiles.append(w_row)
 
