@@ -2,19 +2,25 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """
-End-to-end Engram forward pass on TT hardware.
+End-to-end Engram forward pass: PyTorch reference vs TT hardware.
+
+Uses the same Engram module from engram_demo_v1.py with identical weights
+and input text. Compares outputs at each stage to show numerical equivalence.
 
 Flow:
-  1. Host: key_proj, value_proj (linear projections)
-  2. TT-Lang gating kernel (grid=auto): RMSNorm, dot-product gate, gate*value
-     All (1,1) tile DFBs with loops over hidden dim.
-  3. Host: RMSNorm + pre-shift for conv
-  4. TT-Lang pipe conv kernel (grid=N_CONV_CORES): weighted sum + SiLU with
-     inter-core boundary sharing via PipeNet
-  5. Host: residual add
+  1. Tokenize + Hash + Embed (CPU, shared)
+  2. Key/Value projection (CPU, shared)
+  3. Gating: PyTorch vs TT-Lang kernel (grid=auto, (1,1) tile DFBs)
+  4. ShortConv: PyTorch vs TT-Lang pipe conv kernel (grid=N_CONV_CORES)
+  5. Residual add + final comparison
 
-Validates against PyTorch Engram.forward() output.
+TT-Lang kernels use (1,1) tile DFBs with loops over HIDDEN_TILES
+to work around non-square matmul compiler bug (#383).
 """
+
+import os
+os.environ["HF_HUB_OFFLINE"] = "1"
+os.environ["TRANSFORMERS_OFFLINE"] = "1"
 
 import torch
 import torch.nn as nn
@@ -22,16 +28,22 @@ import math
 import ttnn
 import ttl
 
+from engram_demo_v1 import (
+    EngramConfig, BackBoneConfig, engram_cfg, backbone_config,
+    CompressedTokenizer, NgramHashMapping, MultiHeadEmbedding,
+    ShortConv, Engram,
+)
+from transformers import AutoTokenizer
+
 TILE = 32
 
-ENGRAM_TILES = 32
-HIDDEN_TILES = 32
-ENGRAM_DIM = ENGRAM_TILES * TILE
-HIDDEN_DIM = HIDDEN_TILES * TILE
-
-HC_MULT = 4
-KERNEL_SIZE = 4
-DILATION = 3
+HIDDEN_DIM = backbone_config.hidden_size          # 1024
+ENGRAM_DIM = (engram_cfg.max_ngram_size - 1) * engram_cfg.n_embed_per_ngram  # 1024
+HIDDEN_TILES = HIDDEN_DIM // TILE                  # 32
+ENGRAM_TILES = ENGRAM_DIM // TILE                  # 32
+HC_MULT = backbone_config.hc_mult                  # 4
+KERNEL_SIZE = engram_cfg.kernel_size               # 4
+DILATION = engram_cfg.max_ngram_size               # 3
 N_CONV_CORES = 4
 
 C_MEAN_SCALE = 1.0 / HIDDEN_DIM
@@ -39,61 +51,13 @@ C_INV_SQRT_D = 1.0 / math.sqrt(HIDDEN_DIM)
 C_EPS = 1e-6
 
 
-class EngramModule(nn.Module):
-    """Full Engram gating + ShortConv (no hash/embed)."""
-    def __init__(self):
-        super().__init__()
-        self.value_proj = nn.Linear(ENGRAM_DIM, HIDDEN_DIM, bias=True)
-        self.key_projs = nn.ModuleList(
-            [nn.Linear(ENGRAM_DIM, HIDDEN_DIM, bias=True) for _ in range(HC_MULT)])
-        self.norm1 = nn.ModuleList(
-            [nn.RMSNorm(HIDDEN_DIM) for _ in range(HC_MULT)])
-        self.norm2 = nn.ModuleList(
-            [nn.RMSNorm(HIDDEN_DIM) for _ in range(HC_MULT)])
-        total_ch = HIDDEN_DIM * HC_MULT
-        self.conv = nn.Conv1d(
-            total_ch, total_ch, KERNEL_SIZE, groups=total_ch, bias=False,
-            padding=(KERNEL_SIZE - 1) * DILATION, dilation=DILATION)
-        self.conv_norms = nn.ModuleList(
-            [nn.RMSNorm(HIDDEN_DIM) for _ in range(HC_MULT)])
-        self.silu = nn.SiLU()
-
-    def forward(self, embeddings, hidden_states):
-        gates = []
-        for hc_idx in range(HC_MULT):
-            key = self.key_projs[hc_idx](embeddings)
-            normed_key = self.norm1[hc_idx](key)
-            query = hidden_states[:, :, hc_idx, :]
-            normed_query = self.norm2[hc_idx](query)
-            gate = (normed_key * normed_query).sum(dim=-1) / math.sqrt(HIDDEN_DIM)
-            gate = gate.abs().clamp_min(1e-6).sqrt() * gate.sign()
-            gate = gate.sigmoid().unsqueeze(-1)
-            gates.append(gate)
-        gates = torch.stack(gates, dim=2)
-        value = self.value_proj(embeddings).unsqueeze(2)
-        gated = gates * value
-
-        B, T, G, C = gated.shape
-        normed_chunks = [self.conv_norms[i](gated[:, :, i, :]) for i in range(G)]
-        x_norm = torch.cat(normed_chunks, dim=-1)
-        x_bct = x_norm.transpose(1, 2)
-        y_bct = self.silu(self.conv(x_bct)[..., :T])
-        conv_out = y_bct.transpose(1, 2).view(B, T, G, C)
-        return gated + conv_out
-
-
 # --- Gating kernel (streaming, grid=auto, (1,1) tile DFBs) ---
+# Works around non-square matmul compiler bug (#383) by using (1,1) tiles
+# and looping over HIDDEN_TILES for reduce/normalize.
 
 @ttl.kernel(grid="auto")
 def engram_gate_kernel(key, query, value, key_norm_w, query_norm_w,
                        scaler, mean_scale, inv_sqrt_d, eps_tile, out):
-    """RMSNorm key/query, dot-product gate, gate*value.
-
-    All DFBs are (1,1) to work around non-square matmul compiler bug (#383).
-    Loops over HIDDEN_TILES for reduce/normalize.
-    Per position: 2 passes over key (squares + normalize),
-    2 passes over query, 1 pass over value for output.
-    """
     grid_cols, _ = ttl.grid_size(dims=2)
     seq_tiles = key.shape[0] // TILE
     tiles_per_core = -(-seq_tiles // grid_cols)
@@ -141,7 +105,7 @@ def engram_gate_kernel(key, query, value, key_norm_w, query_norm_w,
                             r.store(ttl.math.reduce_sum(sqv, sc, dims=[0]))
                         with red_dfb.wait() as rv, acc_dfb.wait() as av, acc_dfb.reserve() as new_acc:
                             new_acc.store(av + rv)
-                    # Broadcast col 0 -> all cols, then scale + rsqrt
+                    # Broadcast col 0 -> all cols before rsqrt (reduce leaves garbage)
                     with acc_dfb.wait() as total, bcast_dfb.reserve() as bc:
                         bc.store(ttl.math.broadcast(total, dims=[1]))
                     with bcast_dfb.wait() as bv, red_dfb.reserve() as scaled:
@@ -167,7 +131,6 @@ def engram_gate_kernel(key, query, value, key_norm_w, query_norm_w,
                             r.store(ttl.math.reduce_sum(sqv, sc, dims=[0]))
                         with red_dfb.wait() as rv, acc_dfb.wait() as av, acc_dfb.reserve() as new_acc:
                             new_acc.store(av + rv)
-                    # Broadcast col 0 -> all cols, then scale + rsqrt
                     with acc_dfb.wait() as total, bcast_dfb.reserve() as bc:
                         bc.store(ttl.math.broadcast(total, dims=[1]))
                     with bcast_dfb.wait() as bv, red_dfb.reserve() as scaled:
@@ -179,7 +142,6 @@ def engram_gate_kernel(key, query, value, key_norm_w, query_norm_w,
 
                     # --- Normalize + dot product (interleaved) ---
                     with key_rsq_dfb.wait() as key_rsq, query_rsq_dfb.wait() as query_rsq:
-                        # First tile
                         with key_dfb.wait() as k0, knw_dfb.wait() as wk0, query_dfb.wait() as q0, qnw_dfb.wait() as wq0:
                             with dot_dfb.reserve() as d:
                                 d.store((k0 * key_rsq * wk0) * (q0 * query_rsq * wq0))
@@ -187,7 +149,6 @@ def engram_gate_kernel(key, query, value, key_norm_w, query_norm_w,
                             r.store(ttl.math.reduce_sum(dv, sc, dims=[0]))
                         with red_dfb.wait() as rv, acc_dfb.reserve() as acc:
                             acc.store(rv)
-                        # Remaining tiles
                         for j in range(HIDDEN_TILES - 1):
                             with key_dfb.wait() as kj, knw_dfb.wait() as wkj, query_dfb.wait() as qj, qnw_dfb.wait() as wqj:
                                 with dot_dfb.reserve() as d:
@@ -198,7 +159,6 @@ def engram_gate_kernel(key, query, value, key_norm_w, query_norm_w,
                                 new_acc.store(av + rv)
 
                     # --- Gate ---
-                    # Broadcast col 0 -> all cols (reduce leaves garbage in cols 1-31)
                     with acc_dfb.wait() as ds, bcast_dfb.reserve() as bc:
                         bc.store(ttl.math.broadcast(ds, dims=[1]))
                     with bcast_dfb.wait() as bv, red_dfb.reserve() as sd:
@@ -225,19 +185,15 @@ def engram_gate_kernel(key, query, value, key_norm_w, query_norm_w,
             tx = ttl.copy(inv_sqrt_d[0, 0], blk); tx.wait()
         with eps_dfb.reserve() as blk:
             tx = ttl.copy(eps_tile[0, 0], blk); tx.wait()
-
         for local_t in range(tiles_per_core):
             tile_idx = core_x * tiles_per_core + local_t
             if tile_idx < seq_tiles:
-                # Key pass 1: H tiles for sum of squares
                 for j in range(HIDDEN_TILES):
                     with key_dfb.reserve() as blk:
                         tx = ttl.copy(key[tile_idx, j], blk); tx.wait()
-                # Query pass 1: H tiles for sum of squares
                 for j in range(HIDDEN_TILES):
                     with query_dfb.reserve() as blk:
                         tx = ttl.copy(query[tile_idx, j], blk); tx.wait()
-                # Normalize + dot: key, knw, query, qnw interleaved
                 for j in range(HIDDEN_TILES):
                     with key_dfb.reserve() as blk:
                         tx = ttl.copy(key[tile_idx, j], blk); tx.wait()
@@ -247,7 +203,6 @@ def engram_gate_kernel(key, query, value, key_norm_w, query_norm_w,
                         tx = ttl.copy(query[tile_idx, j], blk); tx.wait()
                     with qnw_dfb.reserve() as blk:
                         tx = ttl.copy(query_norm_w[tile_idx, j], blk); tx.wait()
-                # Value: H tiles
                 for j in range(HIDDEN_TILES):
                     with value_dfb.reserve() as blk:
                         tx = ttl.copy(value[tile_idx, j], blk); tx.wait()
@@ -367,77 +322,151 @@ def host_shift(x, shift, seq_len):
     result[shift:] = x[:seq_len - shift]
     return result
 
+def pad_to_tile(t, dim, tile=TILE):
+    """Pad tensor along `dim` to next multiple of tile."""
+    size = t.shape[dim]
+    pad_size = (tile - size % tile) % tile
+    if pad_size == 0:
+        return t
+    pad_spec = [0] * (2 * t.dim())
+    pad_spec[-(2 * dim + 1)] = pad_size
+    return torch.nn.functional.pad(t, pad_spec)
+
 
 if __name__ == "__main__":
     device = ttnn.open_device(device_id=0)
     torch.manual_seed(42)
 
-    SEQ = 256
-    seq_tiles = SEQ // TILE
+    # ================================================================
+    # Setup: create Engram module, tokenize input
+    # ================================================================
+    LAYER_ID = engram_cfg.layer_ids[0]  # first engram layer
+    engram = Engram(layer_id=LAYER_ID)
 
-    module = EngramModule()
-    embeddings_torch = torch.randn(1, SEQ, ENGRAM_DIM)
-    hidden_states_torch = torch.randn(1, SEQ, HC_MULT, HIDDEN_DIM)
+    text = "Only Alexander the Great could tame the horse Bucephalus."
+    tokenizer = AutoTokenizer.from_pretrained(
+        engram_cfg.tokenizer_name_or_path, trust_remote_code=True)
+    input_ids = tokenizer(text, return_tensors='pt').input_ids
+    B, L = input_ids.shape
+    L_padded = ((L + TILE - 1) // TILE) * TILE
+    print(f"Text: {text!r}")
+    print(f"Tokens: {L}, padded to: {L_padded}")
 
+    # Mock hidden states (same seed for both paths)
+    hidden_states = torch.randn(B, L_padded, HC_MULT, HIDDEN_DIM)
+
+    # ================================================================
+    # Step 1: Hash + Embed (CPU, shared between PyTorch and TT-Lang)
+    # ================================================================
+    print("\n=== Step 1: Hash + Embed (CPU) ===")
     with torch.no_grad():
-        ref = module(embeddings_torch, hidden_states_torch)
-    ref = ref.squeeze(0)
-    print(f"PyTorch ref shape: {ref.shape}")
+        hash_ids = torch.from_numpy(
+            engram.hash_mapping.hash(input_ids)[LAYER_ID])
+        embeddings = engram.multi_head_embedding(hash_ids).flatten(start_dim=-2)
+        embeddings = pad_to_tile(embeddings, dim=1)  # pad seq to L_padded
+    print(f"  embeddings shape: {embeddings.shape}")
+    print(f"  embeddings[0, 0, :4]: {embeddings[0, 0, :4]}")
+    print(f"  embeddings[0, 1, :4]: {embeddings[0, 1, :4]}")
 
+    # ================================================================
+    # Step 2: Key/Value projection (CPU, shared)
+    # ================================================================
+    print("\n=== Step 2: Key/Value Projection (CPU) ===")
+    with torch.no_grad():
+        value_proj = engram.value_proj(embeddings.float())
+        key_projs = [engram.key_projs[i](embeddings.float()) for i in range(HC_MULT)]
+    print(f"  value shape: {value_proj.shape}")
+    print(f"  value[0, 0, :4]: {value_proj[0, 0, :4]}")
+    print(f"  key_0[0, 0, :4]: {key_projs[0][0, 0, :4]}")
+
+    # ================================================================
+    # Step 3: PyTorch gating (reference)
+    # ================================================================
+    print("\n=== Step 3: PyTorch Gating ===")
+    with torch.no_grad():
+        py_gates = []
+        for hc in range(HC_MULT):
+            nk = engram.norm1[hc](key_projs[hc])
+            q = hidden_states[:, :, hc, :]
+            nq = engram.norm2[hc](q)
+            dot = (nk * nq).sum(dim=-1) / math.sqrt(HIDDEN_DIM)
+            g = dot.abs().clamp_min(C_EPS).sqrt() * dot.sign()
+            g = g.sigmoid().unsqueeze(-1)
+            py_gates.append(g)
+        py_gates = torch.stack(py_gates, dim=2)
+        py_gated = py_gates * value_proj.unsqueeze(2)
+    print(f"  gate[0, 0, 0]: {py_gates[0, 0, 0, 0].item():.6f}")
+    print(f"  gate[0, 1, 0]: {py_gates[0, 1, 0, 0].item():.6f}")
+    print(f"  gated[0, 0, 0, :4]: {py_gated[0, 0, 0, :4]}")
+
+    # ================================================================
+    # Step 4: TT-Lang gating
+    # ================================================================
+    print("\n=== Step 4: TT-Lang Gating ===")
     scaler_tt = to_ttnn(torch.ones(32, 32, dtype=torch.bfloat16), device)
     ms_tt = to_ttnn(torch.full((32, 32), C_MEAN_SCALE, dtype=torch.bfloat16), device)
     isd_tt = to_ttnn(torch.full((32, 32), C_INV_SQRT_D, dtype=torch.bfloat16), device)
     eps_tt = to_ttnn(torch.full((32, 32), C_EPS, dtype=torch.bfloat16), device)
 
-    emb_2d = embeddings_torch.squeeze(0)
+    tt_gated_list = []
+    for hc in range(HC_MULT):
+        key_bf16 = key_projs[hc].squeeze(0).to(torch.bfloat16).contiguous()
+        query_bf16 = hidden_states.squeeze(0)[:, hc, :].to(torch.bfloat16).contiguous()
+        value_bf16 = value_proj.squeeze(0).to(torch.bfloat16).contiguous()
+        knw = tile_broadcast_1d(
+            engram.norm1[hc].weight.data.to(torch.bfloat16), L_padded)
+        qnw = tile_broadcast_1d(
+            engram.norm2[hc].weight.data.to(torch.bfloat16), L_padded)
 
-    # Host: value projection (shared across HC groups)
-    with torch.no_grad():
-        value_projected = module.value_proj(emb_2d.float()).to(torch.bfloat16)
-
-    # Step 1: Gating for all 4 HC groups
-    print("Step 1: Gating...")
-    gated_outputs = []
-    for hc_idx in range(HC_MULT):
-        # Host: key projection
-        with torch.no_grad():
-            key_projected = module.key_projs[hc_idx](emb_2d.float()).to(torch.bfloat16)
-
-        query_slice = hidden_states_torch.squeeze(0)[:, hc_idx, :].to(torch.bfloat16).contiguous()
-        knw = tile_broadcast_1d(module.norm1[hc_idx].weight.data.to(torch.bfloat16), SEQ)
-        qnw = tile_broadcast_1d(module.norm2[hc_idx].weight.data.to(torch.bfloat16), SEQ)
-
-        out_tt = to_ttnn(torch.zeros(SEQ, HIDDEN_DIM, dtype=torch.bfloat16), device)
+        out_tt = to_ttnn(
+            torch.zeros(L_padded, HIDDEN_DIM, dtype=torch.bfloat16), device)
         engram_gate_kernel(
-            to_ttnn(key_projected, device),
-            to_ttnn(query_slice, device),
-            to_ttnn(value_projected, device),
+            to_ttnn(key_bf16, device), to_ttnn(query_bf16, device),
+            to_ttnn(value_bf16, device),
             to_ttnn(knw, device), to_ttnn(qnw, device),
             scaler_tt, ms_tt, isd_tt, eps_tt, out_tt)
-        gated_outputs.append(ttnn.to_torch(out_tt))
+        tt_gated_list.append(ttnn.to_torch(out_tt))
 
-    # Step 2: Pipe conv per HC group
-    print("Step 2: Pipe conv...")
-    conv_outputs = []
-    for hc_idx in range(HC_MULT):
-        gated = gated_outputs[hc_idx].float()
+    tt_gated = torch.stack(tt_gated_list, dim=1)  # [L_padded, HC, HIDDEN]
+    print(f"  gated[0, 0, :4]: {tt_gated[0, 0, :4]}")
+
+    # Compare gating
+    py_g2d = py_gated.squeeze(0).to(torch.bfloat16).float()  # [L, HC, D]
+    tt_g2d = tt_gated[:L_padded].float()
+    gate_err = (py_g2d - tt_g2d).abs().max().item()
+    gate_close = torch.allclose(py_g2d, tt_g2d, atol=0.5, rtol=0.1)
+    print(f"  PyTorch vs TT-Lang gating max_err: {gate_err:.4f}")
+    print(f"  allclose(atol=0.5): {gate_close}")
+
+    # ================================================================
+    # Step 5: PyTorch ShortConv (reference)
+    # ================================================================
+    print("\n=== Step 5: PyTorch ShortConv ===")
+    with torch.no_grad():
+        py_conv = engram.short_conv(py_gated)
+    py_output = py_gated + py_conv
+    print(f"  conv[0, 0, 0, :4]: {py_conv[0, 0, 0, :4]}")
+    print(f"  output[0, 0, 0, :4]: {py_output[0, 0, 0, :4]}")
+
+    # ================================================================
+    # Step 6: TT-Lang Pipe Conv
+    # ================================================================
+    print("\n=== Step 6: TT-Lang Pipe Conv ===")
+    tt_conv_list = []
+    for hc in range(HC_MULT):
+        gated_f = tt_gated_list[hc].float()
 
         # RMSNorm on CPU
-        norm_w = module.conv_norms[hc_idx].weight.data.float()
-        rms = torch.rsqrt((gated * gated).mean(dim=-1, keepdim=True) + 1e-5)
-        normed = (gated * rms * norm_w.unsqueeze(0)).to(torch.bfloat16)
+        norm_w = engram.short_conv.norms[hc].weight.data.float()
+        rms = torch.rsqrt((gated_f * gated_f).mean(dim=-1, keepdim=True) + 1e-5)
+        normed = (gated_f * rms * norm_w.unsqueeze(0)).to(torch.bfloat16)
 
-        # Pre-shift on host
         shifts = [0, DILATION, 2 * DILATION, 3 * DILATION]
-        shifted = [host_shift(normed, s, SEQ) for s in shifts]
+        shifted = [host_shift(normed, s, L_padded) for s in shifts]
 
-        # Conv weights: w[k] pairs with in[t - padding + k*D]
-        # k=0->in[t-9]=s3, k=1->in[t-6]=s2, k=2->in[t-3]=s1, k=3->in[t]=s0
-        # So weight for s_j is w[KERNEL_SIZE-1-j]
-        ch_start = hc_idx * HIDDEN_DIM
+        ch_start = hc * HIDDEN_DIM
         ch_end = ch_start + HIDDEN_DIM
-        conv_w = module.conv.weight.data[ch_start:ch_end, 0, :].to(torch.bfloat16)
-
+        conv_w = engram.short_conv.conv.weight.data[ch_start:ch_end, 0, :].to(torch.bfloat16)
         weight_tiles = []
         for k in range(KERNEL_SIZE):
             w_row = conv_w[:, KERNEL_SIZE - 1 - k].unsqueeze(0).expand(TILE, -1).contiguous()
@@ -445,35 +474,49 @@ if __name__ == "__main__":
 
         s_tts = [to_ttnn(s, device) for s in shifted]
         w_tts = [to_ttnn(w, device) for w in weight_tiles]
-        out_tt = to_ttnn(torch.zeros(SEQ, HIDDEN_DIM, dtype=torch.bfloat16), device)
+        out_tt = to_ttnn(
+            torch.zeros(L_padded, HIDDEN_DIM, dtype=torch.bfloat16), device)
+        pipe_conv_kernel(
+            s_tts[0], s_tts[1], s_tts[2], s_tts[3],
+            w_tts[0], w_tts[1], w_tts[2], w_tts[3], out_tt)
+        tt_conv_list.append(ttnn.to_torch(out_tt))
 
-        pipe_conv_kernel(s_tts[0], s_tts[1], s_tts[2], s_tts[3],
-                         w_tts[0], w_tts[1], w_tts[2], w_tts[3], out_tt)
-        conv_outputs.append(ttnn.to_torch(out_tt))
+    # Residual add
+    tt_output = torch.zeros(L_padded, HC_MULT, HIDDEN_DIM)
+    for hc in range(HC_MULT):
+        tt_output[:, hc, :] = tt_gated_list[hc].float() + tt_conv_list[hc].float()
+    print(f"  conv[0, 0, :4]: {tt_conv_list[0][0, :4]}")
+    print(f"  output[0, 0, :4]: {tt_output[0, 0, :4]}")
 
-    # Step 3: Residual add on CPU
-    tt_result = torch.zeros(SEQ, HC_MULT, HIDDEN_DIM)
-    for hc_idx in range(HC_MULT):
-        tt_result[:, hc_idx, :] = gated_outputs[hc_idx].float() + conv_outputs[hc_idx].float()
+    # ================================================================
+    # Final comparison
+    # ================================================================
+    print("\n" + "=" * 60)
+    print("FINAL COMPARISON: PyTorch vs TT-Lang")
+    print("=" * 60)
 
-    print(f"TT-Lang result shape: {tt_result.shape}")
+    py_out = py_output.squeeze(0)[:L_padded].to(torch.bfloat16).float()
+    tt_out = tt_output.float()
 
-    ref_bf16 = ref.to(torch.bfloat16).float()
-    tt_f32 = tt_result.float()
+    for hc in range(HC_MULT):
+        err = (py_out[:, hc, :] - tt_out[:, hc, :]).abs().max().item()
+        print(f"  HC {hc}: max_err={err:.4f}")
 
-    for hc_idx in range(HC_MULT):
-        hc_err = (ref_bf16[:, hc_idx, :] - tt_f32[:, hc_idx, :]).abs().max().item()
-        print(f"HC {hc_idx}: max_err={hc_err:.4f}")
+    overall_max = (py_out - tt_out).abs().max().item()
+    overall_mean = (py_out - tt_out).abs().mean().item()
+    print(f"\n  Overall max_err={overall_max:.4f}, mean_err={overall_mean:.6f}")
+    print(f"  Config: L={L}, L_padded={L_padded}, HIDDEN_DIM={HIDDEN_DIM}")
+    print(f"  Kernels: gating(grid=auto) + pipe_conv(grid={N_CONV_CORES})")
 
-    overall_max = (ref_bf16 - tt_f32).abs().max().item()
-    overall_mean = (ref_bf16 - tt_f32).abs().mean().item()
-    print(f"\nOverall: max_err={overall_max:.4f}, mean_err={overall_mean:.6f}")
-    print(f"Config: SEQ={SEQ}, ENGRAM_DIM={ENGRAM_DIM}, HIDDEN_DIM={HIDDEN_DIM}")
-    print(f"Kernels: gating(grid=auto) + pipe_conv(grid={N_CONV_CORES})")
+    print(f"\n  PyTorch  output[0, 0, :6]: {py_out[0, 0, :6]}")
+    print(f"  TT-Lang  output[0, 0, :6]: {tt_out[0, 0, :6]}")
+    print(f"  PyTorch  output[1, 0, :6]: {py_out[1, 0, :6]}")
+    print(f"  TT-Lang  output[1, 0, :6]: {tt_out[1, 0, :6]}")
 
+    close = torch.allclose(py_out, tt_out, atol=0.5, rtol=0.1)
     if overall_max < 5.0:
-        print("PASS: Full E2E Engram (gating + pipe conv + residual)")
+        print(f"\nPASS (max_err={overall_max:.4f}, allclose={close})")
     else:
-        print("FAIL: E2E mismatch")
+        print(f"\nFAIL (max_err={overall_max:.4f})")
 
     ttnn.close_device(device)
