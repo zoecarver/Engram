@@ -2,15 +2,16 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """
-End-to-end Engram forward pass: gating + ShortConv + residual.
+End-to-end Engram forward pass on TT hardware.
 
 Flow:
-  1. TT-Lang gating kernel: key_proj, RMSNorm, dot-product gate, value_proj
-  2. Host: RMSNorm + pre-shift for conv (depthwise conv1d decomposition)
-  3. TT-Lang conv kernel: streaming weighted sum + SiLU
-  4. Host: residual add (value + conv_output)
+  1. TT-Lang gating kernel (grid=auto): key_proj, RMSNorm, gate, value_proj
+  2. Host: RMSNorm + pre-shift for conv
+  3. TT-Lang pipe conv kernel (grid=N_CONV_CORES): weighted sum + SiLU with
+     inter-core boundary sharing via PipeNet
+  4. Host: residual add
 
-Validates against full PyTorch Engram.forward() output.
+Validates against PyTorch Engram.forward() output.
 """
 
 import torch
@@ -20,13 +21,21 @@ import ttnn
 import ttl
 
 TILE = 32
+
+# Dimensions (1,1 tiles for now; scaling blocked by compiler #365 non-square matmul)
 ENGRAM_TILES = 1
 HIDDEN_TILES = 1
 ENGRAM_DIM = ENGRAM_TILES * TILE
 HIDDEN_DIM = HIDDEN_TILES * TILE
+
 HC_MULT = 4
 KERNEL_SIZE = 4
 DILATION = 3
+N_CONV_CORES = 4
+
+C_MEAN_SCALE = 1.0 / HIDDEN_DIM
+C_INV_SQRT_D = 1.0 / math.sqrt(HIDDEN_DIM)
+C_EPS = 1e-6
 
 
 class EngramModule(nn.Module):
@@ -49,7 +58,6 @@ class EngramModule(nn.Module):
         self.silu = nn.SiLU()
 
     def forward(self, embeddings, hidden_states):
-        # Gating
         gates = []
         for hc_idx in range(HC_MULT):
             key = self.key_projs[hc_idx](embeddings)
@@ -62,23 +70,19 @@ class EngramModule(nn.Module):
             gates.append(gate)
         gates = torch.stack(gates, dim=2)
         value = self.value_proj(embeddings).unsqueeze(2)
-        gated = gates * value  # [B, L, HC_MULT, D]
+        gated = gates * value
 
-        # ShortConv
         B, T, G, C = gated.shape
-        normed_chunks = []
-        for i in range(G):
-            normed_chunks.append(self.conv_norms[i](gated[:, :, i, :]))
-        x_norm = torch.cat(normed_chunks, dim=-1)  # [B, T, G*C]
+        normed_chunks = [self.conv_norms[i](gated[:, :, i, :]) for i in range(G)]
+        x_norm = torch.cat(normed_chunks, dim=-1)
         x_bct = x_norm.transpose(1, 2)
-        y_bct = self.conv(x_bct)[..., :T]
-        y_bct = self.silu(y_bct)
+        y_bct = self.silu(self.conv(x_bct)[..., :T])
         conv_out = y_bct.transpose(1, 2).view(B, T, G, C)
-
         return gated + conv_out
 
 
-# Reuse validated kernels
+# --- Gating kernel (streaming, grid=auto) ---
+
 @ttl.kernel(grid="auto")
 def engram_gate_kernel(emb_a, emb_b, query, key_weight, key_bias,
                        value_weight, value_bias, key_norm_w, query_norm_w,
@@ -219,11 +223,15 @@ def engram_gate_kernel(emb_a, emb_b, query, key_weight, key_bias,
                     tx = ttl.copy(blk, out[tile_idx, 0:HIDDEN_TILES]); tx.wait()
 
 
-@ttl.kernel(grid="auto")
-def conv_kernel(s0, s1, s2, s3, w0, w1, w2, w3, out):
-    grid_cols, _ = ttl.grid_size(dims=2)
+# --- Pipe conv kernel (grid=N_CONV_CORES, forward pipe chain) ---
+
+@ttl.kernel(grid=(N_CONV_CORES, 1))
+def pipe_conv_kernel(s0, s1, s2, s3, w0, w1, w2, w3, out):
     seq_tiles = s0.shape[0] // TILE
-    tiles_per_core = -(-seq_tiles // grid_cols)
+    tiles_per_core = -(-seq_tiles // N_CONV_CORES)
+
+    pipes = [ttl.Pipe((x, 0), ((x + 1), 0)) for x in range(N_CONV_CORES - 1)]
+    net = ttl.PipeNet(pipes)
 
     s0_dfb = ttl.make_dataflow_buffer_like(s0, shape=(1, HIDDEN_TILES), buffer_factor=2)
     s1_dfb = ttl.make_dataflow_buffer_like(s1, shape=(1, HIDDEN_TILES), buffer_factor=2)
@@ -235,10 +243,16 @@ def conv_kernel(s0, s1, s2, s3, w0, w1, w2, w3, out):
     w3_dfb = ttl.make_dataflow_buffer_like(w3, shape=(1, HIDDEN_TILES), buffer_factor=1)
     acc_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, HIDDEN_TILES), buffer_factor=2)
     out_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, HIDDEN_TILES), buffer_factor=2)
+    bnd_dfb = ttl.make_dataflow_buffer_like(s0, shape=(1, HIDDEN_TILES), buffer_factor=2)
 
     @ttl.compute()
     def compute():
         core_x, _ = ttl.core(dims=2)
+        if core_x > 0:
+            with bnd_dfb.wait() as bnd, acc_dfb.reserve() as ctx:
+                ctx.store(bnd)
+            with acc_dfb.wait() as ctx, out_dfb.reserve() as o:
+                o.store(ctx)
         with w0_dfb.wait() as cw0, w1_dfb.wait() as cw1, w2_dfb.wait() as cw2, w3_dfb.wait() as cw3:
             for local_t in range(tiles_per_core):
                 tile_idx = core_x * tiles_per_core + local_t
@@ -252,6 +266,11 @@ def conv_kernel(s0, s1, s2, s3, w0, w1, w2, w3, out):
     @ttl.datamovement()
     def dm_read():
         core_x, _ = ttl.core(dims=2)
+        if core_x > 0:
+            with bnd_dfb.reserve() as blk:
+                def recv(pipe):
+                    xf = ttl.copy(pipe, blk); xf.wait()
+                net.if_dst(recv)
         with w0_dfb.reserve() as blk:
             tx = ttl.copy(w0[0, 0:HIDDEN_TILES], blk); tx.wait()
         with w1_dfb.reserve() as blk:
@@ -265,6 +284,11 @@ def conv_kernel(s0, s1, s2, s3, w0, w1, w2, w3, out):
             if tile_idx < seq_tiles:
                 with s0_dfb.reserve() as blk:
                     tx = ttl.copy(s0[tile_idx, 0:HIDDEN_TILES], blk); tx.wait()
+                    if local_t == tiles_per_core - 1:
+                        if core_x < N_CONV_CORES - 1:
+                            def send(pipe):
+                                xf = ttl.copy(blk, pipe); xf.wait()
+                            net.if_src(send)
                 with s1_dfb.reserve() as blk:
                     tx = ttl.copy(s1[tile_idx, 0:HIDDEN_TILES], blk); tx.wait()
                 with s2_dfb.reserve() as blk:
@@ -275,6 +299,10 @@ def conv_kernel(s0, s1, s2, s3, w0, w1, w2, w3, out):
     @ttl.datamovement()
     def dm_write():
         core_x, _ = ttl.core(dims=2)
+        if core_x > 0:
+            prev_tile = core_x * tiles_per_core - 1
+            with out_dfb.wait() as blk:
+                tx = ttl.copy(blk, out[prev_tile, 0:HIDDEN_TILES]); tx.wait()
         for local_t in range(tiles_per_core):
             tile_idx = core_x * tiles_per_core + local_t
             if tile_idx < seq_tiles:
@@ -282,15 +310,15 @@ def conv_kernel(s0, s1, s2, s3, w0, w1, w2, w3, out):
                     tx = ttl.copy(blk, out[tile_idx, 0:HIDDEN_TILES]); tx.wait()
 
 
+# --- Utilities ---
+
 def to_ttnn(tensor, device):
     return ttnn.from_torch(
         tensor, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
         device=device, memory_config=ttnn.DRAM_MEMORY_CONFIG)
 
-
 def tile_broadcast_1d(vec, seq_len):
     return vec.unsqueeze(0).expand(seq_len, -1).contiguous()
-
 
 def host_shift(x, shift, seq_len):
     if shift == 0:
@@ -316,22 +344,17 @@ if __name__ == "__main__":
     ref = ref.squeeze(0)
     print(f"PyTorch ref shape: {ref.shape}")
 
-    # Scalar tiles
-    scaler_torch = torch.ones(32, 32, dtype=torch.bfloat16)
-    ms_torch = torch.full((32, 32), 1.0 / HIDDEN_DIM, dtype=torch.bfloat16)
-    isd_torch = torch.full((32, 32), 1.0 / math.sqrt(HIDDEN_DIM), dtype=torch.bfloat16)
-    eps_torch = torch.full((32, 32), 1e-6, dtype=torch.bfloat16)
-
-    scaler_tt = to_ttnn(scaler_torch, device)
-    ms_tt = to_ttnn(ms_torch, device)
-    isd_tt = to_ttnn(isd_torch, device)
-    eps_tt = to_ttnn(eps_torch, device)
+    scaler_tt = to_ttnn(torch.ones(32, 32, dtype=torch.bfloat16), device)
+    ms_tt = to_ttnn(torch.full((32, 32), C_MEAN_SCALE, dtype=torch.bfloat16), device)
+    isd_tt = to_ttnn(torch.full((32, 32), C_INV_SQRT_D, dtype=torch.bfloat16), device)
+    eps_tt = to_ttnn(torch.full((32, 32), C_EPS, dtype=torch.bfloat16), device)
 
     emb_2d = embeddings_torch.squeeze(0).to(torch.bfloat16)
     vw = module.value_proj.weight.data.T.to(torch.bfloat16).contiguous()
     vb = tile_broadcast_1d(module.value_proj.bias.data.to(torch.bfloat16), SEQ)
 
     # Step 1: Gating for all 4 HC groups
+    print("Step 1: Gating...")
     gated_outputs = []
     for hc_idx in range(HC_MULT):
         kw = module.key_projs[hc_idx].weight.data.T.to(torch.bfloat16).contiguous()
@@ -350,12 +373,13 @@ if __name__ == "__main__":
             scaler_tt, ms_tt, isd_tt, eps_tt, out_tt)
         gated_outputs.append(ttnn.to_torch(out_tt))
 
-    # Step 2: ShortConv per HC group (RMSNorm + depthwise conv + SiLU)
+    # Step 2: Pipe conv per HC group
+    print("Step 2: Pipe conv...")
     conv_outputs = []
     for hc_idx in range(HC_MULT):
-        gated = gated_outputs[hc_idx].float()  # [SEQ, HIDDEN_DIM]
+        gated = gated_outputs[hc_idx].float()
 
-        # RMSNorm on CPU (conv norm)
+        # RMSNorm on CPU
         norm_w = module.conv_norms[hc_idx].weight.data.float()
         rms = torch.rsqrt((gated * gated).mean(dim=-1, keepdim=True) + 1e-5)
         normed = (gated * rms * norm_w.unsqueeze(0)).to(torch.bfloat16)
@@ -364,12 +388,9 @@ if __name__ == "__main__":
         shifts = [0, DILATION, 2 * DILATION, 3 * DILATION]
         shifted = [host_shift(normed, s, SEQ) for s in shifts]
 
-        # Conv weights for this HC group's channels
-        # nn.Conv1d applies: out[t] = sum_k w[k] * in[t - padding + k*dilation]
-        # With padding=9, dilation=3: w[k] * in[t - 9 + k*3]
-        # k=0: in[t-9], k=1: in[t-6], k=2: in[t-3], k=3: in[t]
-        # Our shifts: s0=in[t], s1=in[t-3], s2=in[t-6], s3=in[t-9]
-        # So: s0 pairs with w[3], s1 with w[2], s2 with w[1], s3 with w[0]
+        # Conv weights: w[k] pairs with in[t - padding + k*D]
+        # k=0->in[t-9]=s3, k=1->in[t-6]=s2, k=2->in[t-3]=s1, k=3->in[t]=s0
+        # So weight for s_j is w[KERNEL_SIZE-1-j]
         ch_start = hc_idx * HIDDEN_DIM
         ch_end = ch_start + HIDDEN_DIM
         conv_w = module.conv.weight.data[ch_start:ch_end, 0, :].to(torch.bfloat16)
@@ -383,8 +404,8 @@ if __name__ == "__main__":
         w_tts = [to_ttnn(w, device) for w in weight_tiles]
         out_tt = to_ttnn(torch.zeros(SEQ, HIDDEN_DIM, dtype=torch.bfloat16), device)
 
-        conv_kernel(s_tts[0], s_tts[1], s_tts[2], s_tts[3],
-                     w_tts[0], w_tts[1], w_tts[2], w_tts[3], out_tt)
+        pipe_conv_kernel(s_tts[0], s_tts[1], s_tts[2], s_tts[3],
+                         w_tts[0], w_tts[1], w_tts[2], w_tts[3], out_tt)
         conv_outputs.append(ttnn.to_torch(out_tt))
 
     # Step 3: Residual add on CPU
@@ -404,11 +425,12 @@ if __name__ == "__main__":
     overall_max = (ref_bf16 - tt_f32).abs().max().item()
     overall_mean = (ref_bf16 - tt_f32).abs().mean().item()
     print(f"\nOverall: max_err={overall_max:.4f}, mean_err={overall_mean:.6f}")
-    print(f"Seq={SEQ}, ENGRAM_DIM={ENGRAM_DIM}, HIDDEN_DIM={HIDDEN_DIM}")
+    print(f"Config: SEQ={SEQ}, ENGRAM_DIM={ENGRAM_DIM}, HIDDEN_DIM={HIDDEN_DIM}")
+    print(f"Kernels: gating(grid=auto) + pipe_conv(grid={N_CONV_CORES})")
 
     if overall_max < 2.0:
-        print("PASS: Full Engram forward (gating + conv + residual)")
+        print("PASS: Full E2E Engram (gating + pipe conv + residual)")
     else:
-        print("FAIL: Full Engram mismatch")
+        print("FAIL: E2E mismatch")
 
     ttnn.close_device(device)
